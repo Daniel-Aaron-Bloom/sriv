@@ -1,0 +1,84 @@
+export component AppWindow inherits Window {
+    callback pointer-event(PointerEvent);
+    callback scroll-event(PointerScrollEvent) -> EventResult;
+    callback rotate(int);
+    callback close-requested();
+    pure callback get_width() -> length;
+    pure callback get_height() -> length;
+    in property <bool> entered;
+    in property <bool> focused;
+    in property <bool> dragged;
+    in property <image> picture;
+    
+    no-frame: true;
+    icon: @image-url("icon.png");
+    preferred-width: get_width();
+    preferred-height: get_height();
+
+    image := Image {
+        width: parent.width - 2px;
+        height: parent.height - 2px;
+        x: 1px;
+        y: 1px;
+        z: 1.0;
+        source: root.picture;
+    }
+    forward-focus: fs;
+    fs := FocusScope {
+        KeyBinding {
+            keys: @keys(LeftArrow);
+            activated => { root.rotate(-1); }
+        }
+        KeyBinding {
+            keys: @keys(RightArrow);
+            activated => { root.rotate(1); }
+        }
+        KeyBinding {
+            keys: @keys(Escape);
+            activated => { root.close-requested(); }
+        }
+    }
+    ta := TouchArea {
+        forward-focus: fs;
+        pointer-event(e) => { root.pointer-event(e); }
+        scroll-event(e) => { root.scroll-event(e) }
+    }
+
+    Rectangle {
+        z: 0.0;
+        states [
+            focus-hover when root.focused && root.entered: {
+                background: #60856823;
+            }
+            focus when root.dragged: {
+                background: #67609223;
+            }
+            hover when !root.focused && root.entered: {
+                background: #a7727223;
+            }
+            default when true: {
+                background: transparent;
+            }
+        ]
+    }
+
+    background: transparent;
+
+    // states [
+    //     focus-hover when focused && entered: {
+    //         background: #60856803;
+    //     }
+    //     focus when focused && !entered: {
+    //         // background: transparent;
+    //         background: #67609203;
+    //     }
+    //     hover when !focused && entered: {
+    //         // background: transparent;
+    //         background: #a7727203;
+    //     }
+    //     inactive when !focused && !entered: {
+    //         // background: transparent;
+    //         background: #9e9e9e03;
+    //     }
+    // ]
+}
