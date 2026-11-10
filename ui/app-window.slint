@@ -9,8 +9,11 @@ export component AppWindow inherits Window {
     in property <bool> focused;
     in property <bool> dragged;
     in property <image> picture;
-    
+    // Non-empty shows a dismissible error bar at the bottom of the window.
+    in-out property <string> error-text;
+
     no-frame: true;
+    title: "sriv";
     icon: @image-url("icon.png");
     preferred-width: get_width();
     preferred-height: get_height();
@@ -64,21 +67,37 @@ export component AppWindow inherits Window {
 
     background: transparent;
 
-    // states [
-    //     focus-hover when focused && entered: {
-    //         background: #60856803;
-    //     }
-    //     focus when focused && !entered: {
-    //         // background: transparent;
-    //         background: #67609203;
-    //     }
-    //     hover when !focused && entered: {
-    //         // background: transparent;
-    //         background: #a7727203;
-    //     }
-    //     inactive when !focused && !entered: {
-    //         // background: transparent;
-    //         background: #9e9e9e03;
-    //     }
-    // ]
+    // Error bar: visible while error-text is non-empty; click anywhere on it
+    // to dismiss. Sits above the picture (z: 2.0) so it stays readable.
+    if root.error-text != "": Rectangle {
+        z: 2.0;
+        x: 0;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 30px;
+        background: #8e2f24e6;
+        Text {
+            x: 10px;
+            width: parent.width - 36px;
+            height: parent.height;
+            text: root.error-text;
+            color: #ffe4de;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            x: parent.width - self.width - 10px;
+            height: parent.height;
+            text: "✕";
+            color: #ffe4de;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.error-text = ""; }
+        }
+    }
 }

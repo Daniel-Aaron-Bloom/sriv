@@ -5,7 +5,6 @@ use std::{
     cell::{Cell, RefCell},
     env::{self, args_os},
     error::Error,
-    mem,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -13,14 +12,23 @@ use std::{
 slint::include_modules!();
 use i_slint_backend_winit::{EventResult as WinitWindowEventResult, WinitWindowAccessor};
 use i_slint_core::items::{EventResult, PointerEventKind};
-use image::{ColorType, DynamicImage, GenericImageView, ImageDecoder, ImageReader};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageReader};
+use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use resvg::{tiny_skia, usvg};
 use slint::{
-    BackendSelector, Image, PhysicalSize, Rgba8Pixel, SharedPixelBuffer,
+    BackendSelector, Image, PhysicalSize, SharedPixelBuffer,
     platform::{PointerEventButton, WindowEvent::CloseRequested},
     set_xdg_app_id,
 };
 use winit::event::WindowEvent as WinitEvent;
+
+/// println! in debug builds only; compiled away in release builds.
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        println!($($arg)*)
+    };
+}
 
 fn load_oriented_image(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
     let mut decoder = ImageReader::open(path)?
@@ -32,14 +40,31 @@ fn load_oriented_image(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
     Ok(image)
 }
 
-fn load_any_image(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
-    load_oriented_image(path)
-        .or_else(|_| load_by_extension(path))
-        .or_else(|_| load_svg_image(path))
-}
-
 fn load_by_extension(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
     Ok(ImageReader::open(path)?.decode()?)
+}
+
+// HEIC/HEIF (e.g. iPhone photos), which the image crate cannot decode.
+// libheif applies the container's geometric transformations (rotation,
+// mirroring) while decoding, so orientation is handled as with EXIF above.
+fn load_heic_image(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
+    let name = path.to_str().ok_or("HEIC path is not valid UTF-8")?;
+    let context = HeifContext::read_from_file(name)?;
+    let handle = context.primary_image_handle()?;
+    let decoded = LibHeif::new().decode(&handle, ColorSpace::Rgb(RgbChroma::Rgba), None)?;
+    let plane = decoded
+        .planes()
+        .interleaved
+        .ok_or("libheif returned no interleaved RGBA plane")?;
+    // Plane rows are padded to the stride; repack them without the padding.
+    let row_len = plane.width as usize * 4;
+    let mut pixels = Vec::with_capacity(plane.height as usize * row_len);
+    for row in 0..plane.height as usize {
+        pixels.extend_from_slice(&plane.data[row * plane.stride..][..row_len]);
+    }
+    let image = image::RgbaImage::from_raw(plane.width, plane.height, pixels)
+        .ok_or("libheif plane dimensions do not match")?;
+    Ok(DynamicImage::ImageRgba8(image))
 }
 
 // Rasterize SVGs with the same engine Slint's own loader uses (resvg), so they
@@ -62,10 +87,59 @@ fn load_svg_image(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
     Ok(DynamicImage::ImageRgba8(rgba))
 }
 
+// Try each loader in turn. If everything fails, report the error from the
+// first attempt: later fallbacks produce misleading messages (e.g. an SVG
+// parse error for a corrupt PNG). HEIF containers are the exception — their
+// most specific error comes from the libheif attempt.
+fn load_any_image(path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
+    let first_err = match load_oriented_image(path) {
+        Ok(img) => return Ok(img),
+        Err(e) => e,
+    };
+    if let Ok(img) = load_by_extension(path) {
+        return Ok(img);
+    }
+    let heic_err = match load_heic_image(path) {
+        Ok(img) => return Ok(img),
+        Err(e) => e,
+    };
+    if matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("heic" | "heif" | "hif" | "avif")
+    ) {
+        return Err(heic_err);
+    }
+    load_svg_image(path).map_err(|_| first_err)
+}
+
+// For already-Rgba8 sources, pass the buffer straight to Slint instead of
+// cloning through to_rgba8() — one full-image copy less per push.
 fn display_image(img: &DynamicImage) -> Image {
     let (width, height) = img.dimensions();
-    let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&img.to_rgba8(), width, height);
-    Image::from_rgba8(buffer)
+    match img {
+        DynamicImage::ImageRgba8(buffer) => {
+            Image::from_rgba8(SharedPixelBuffer::clone_from_slice(buffer, width, height))
+        }
+        other => Image::from_rgba8(SharedPixelBuffer::clone_from_slice(
+            &other.to_rgba8(),
+            width,
+            height,
+        )),
+    }
+}
+
+// Neutral dark placeholder shown when launched without a file (or when the
+// initial file failed to load), sized so the window is usable instead of
+// 1x1 pixels.
+fn placeholder_image() -> DynamicImage {
+    DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+        512,
+        384,
+        image::Rgba([0x20, 0x20, 0x24, 0xff]),
+    ))
 }
 
 struct Viewer {
@@ -97,14 +171,14 @@ impl Viewer {
     }
 
     fn rotate(&self, app: &AppWindow, dir: i32) {
-        let placeholder = DynamicImage::new(1, 1, ColorType::Rgba8);
-        let img = mem::replace(&mut *self.src.borrow_mut(), placeholder);
-        let img = if dir < 0 {
-            img.rotate270()
+        // rotate90/rotate270 take &self and return a new image, so there is
+        // nothing to swap in place.
+        let rotated = if dir < 0 {
+            self.src.borrow().rotate270()
         } else {
-            img.rotate90()
+            self.src.borrow().rotate90()
         };
-        *self.src.borrow_mut() = img;
+        *self.src.borrow_mut() = rotated;
         self.push_image(app);
     }
 }
@@ -125,12 +199,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     selector.select()?;
     set_xdg_app_id("sriv")?;
 
-    let initial = if let Some(path) = args_os().nth(1) {
-        println!("{path:?}");
-        let path = PathBuf::from(path);
-        load_any_image(&path)?
+    // Load the file passed on the command line, if any. On failure, still
+    // open a window and report the problem in the UI instead of dying without
+    // a trace — the desktop entry launches us without a terminal.
+    let mut startup_error = None;
+    let initial = if let Some(arg) = args_os().nth(1) {
+        let path = PathBuf::from(arg);
+        dlog!("Loading {path:?}");
+        match load_any_image(&path) {
+            Ok(img) => img,
+            Err(e) => {
+                startup_error = Some(format!("Couldn't load {}: {e}", path.display()));
+                placeholder_image()
+            }
+        }
     } else {
-        DynamicImage::new(1, 1, ColorType::Rgba8)
+        placeholder_image()
     };
 
     let (width, height) = initial.dimensions();
@@ -142,6 +226,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let app = AppWindow::new()?;
+    if let Some(error) = startup_error {
+        app.set_error_text(error.into());
+    }
     viewer.push_image(&app);
     app.window().on_winit_window_event({
         let viewer = viewer.clone();
@@ -150,47 +237,45 @@ fn main() -> Result<(), Box<dyn Error>> {
             let app = app_handle.unwrap();
             match event {
                 WinitEvent::HoveredFile(_f) => {
-                    #[cfg(debug_assertions)]
-                    println!("Hover {_f:?}");
+                    dlog!("Hover {_f:?}");
                     WinitWindowEventResult::Propagate
                 }
                 WinitEvent::HoveredFileCancelled => {
-                    #[cfg(debug_assertions)]
-                    println!("Hover Cancel");
+                    dlog!("Hover Cancel");
                     WinitWindowEventResult::Propagate
                 }
                 WinitEvent::DroppedFile(f) => {
-                    #[cfg(debug_assertions)]
-                    println!("Dropped {f:?}");
+                    dlog!("Dropped {f:?}");
                     match load_any_image(f) {
                         Ok(img) => {
                             *viewer.src.borrow_mut() = img;
                             viewer.scale.set(1.0);
                             viewer.push_image(&app);
+                            app.set_error_text("".into());
                             WinitWindowEventResult::PreventDefault
                         }
                         Err(e) => {
-                            eprintln!("Failed to load dropped file: {e}");
+                            dlog!("Failed to load dropped file: {e}");
+                            app.set_error_text(
+                                format!("Couldn't load {}: {e}", f.display()).into(),
+                            );
                             WinitWindowEventResult::Propagate
                         }
                     }
                 }
                 WinitEvent::Focused(focused) => {
-                    #[cfg(debug_assertions)]
-                    println!("Entered");
+                    dlog!("Focused");
                     app.set_focused(*focused);
                     WinitWindowEventResult::Propagate
                 }
                 WinitEvent::CursorEntered { .. } => {
-                    #[cfg(debug_assertions)]
-                    println!("Entered");
+                    dlog!("Entered");
                     app.set_entered(true);
                     app.set_dragged(false);
                     WinitWindowEventResult::Propagate
                 }
                 WinitEvent::CursorLeft { .. } => {
-                    #[cfg(debug_assertions)]
-                    println!("Left");
+                    dlog!("Left");
                     app.set_entered(false);
                     WinitWindowEventResult::Propagate
                 }
@@ -235,9 +320,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             let app = app_handle.unwrap();
             let new_scale = viewer.scale.get() + e.delta_y / scale_factor;
+            // Cap the longest displayed side at 8192 logical pixels so a few
+            // wheel ticks can't blow the window far past the screen.
+            let size = viewer.dim.get();
+            let max_scale = 8192f32 / f32::max(size.width as f32, size.height as f32);
             viewer
                 .scale
-                .set(f32::max(viewer.min_scale.get(), new_scale));
+                .set(new_scale.min(max_scale).max(viewer.min_scale.get()));
             viewer.apply_size(&app);
             EventResult::Accept
         }
@@ -253,8 +342,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     app.on_close_requested({
         let app_handle = app.as_weak();
         move || {
-            #[cfg(debug_assertions)]
-            println!("Closing");
+            dlog!("Closing");
             let app = app_handle.unwrap();
             app.window().dispatch_event(CloseRequested);
         }
@@ -263,8 +351,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let app_handle = app.as_weak();
         move |e| {
             if e.button == PointerEventButton::Left && e.kind == PointerEventKind::Down {
-                #[cfg(debug_assertions)]
-                println!("Dragged");
+                dlog!("Dragged");
                 let app = app_handle.unwrap();
                 app.set_dragged(true);
                 app.window().with_winit_window(|win| {
@@ -272,14 +359,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 });
             }
             if e.button == PointerEventButton::Right && e.kind == PointerEventKind::Down {
-                #[cfg(debug_assertions)]
-                println!("Closing");
+                dlog!("Closing");
                 let app = app_handle.unwrap();
                 app.window().dispatch_event(CloseRequested);
             }
             if e.button == PointerEventButton::Left && e.kind == PointerEventKind::Up {
-                #[cfg(debug_assertions)]
-                println!("Undragged");
+                dlog!("Undragged");
                 let app = app_handle.unwrap();
                 app.set_dragged(false);
             }
@@ -289,4 +374,69 @@ fn main() -> Result<(), Box<dyn Error>> {
     app.run()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libheif_rs::{Channel, CompressionFormat};
+
+    // Encode a solid-color image into a real HEIC via libheif's own encoder,
+    // then decode it through load_heic_image. Skips on machines whose libheif
+    // has no HEVC encoder (x265) plugin.
+    #[test]
+    fn heic_roundtrip() -> Result<(), Box<dyn Error>> {
+        const W: u32 = 64;
+        const H: u32 = 48;
+        const COLOR: [u8; 4] = [200, 30, 140, 255];
+
+        let lh = LibHeif::new();
+        let mut encoder = match lh.encoder_for_format(CompressionFormat::Hevc) {
+            Ok(encoder) => encoder,
+            Err(_) => return Ok(()),
+        };
+
+        let mut encoded_image = libheif_rs::Image::new(W, H, ColorSpace::Rgb(RgbChroma::Rgba))?;
+        encoded_image.create_plane(Channel::Interleaved, W, H, 8)?;
+        {
+            let plane = encoded_image
+                .planes_mut()
+                .interleaved
+                .expect("no interleaved plane");
+            for row in 0..H as usize {
+                for px in plane.data[row * plane.stride..][..W as usize * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                {
+                    px.copy_from_slice(&COLOR);
+                }
+            }
+        }
+
+        let mut context = HeifContext::new()?;
+        context.encode_image(&encoded_image, &mut encoder, None)?;
+        let bytes = context.write_to_bytes()?;
+        assert!(
+            bytes.len() > 8,
+            "suspiciously tiny HEIC: {} bytes",
+            bytes.len()
+        );
+
+        let path = std::env::temp_dir().join("sriv-heic-roundtrip.heic");
+        std::fs::write(&path, &bytes)?;
+        let decoded = load_heic_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let decoded = decoded?;
+
+        assert_eq!(decoded.dimensions(), (W, H));
+        // x265 is lossy, but a solid color should survive roughly intact.
+        let center = decoded.get_pixel(W / 2, H / 2);
+        for (got, want) in center.0.iter().zip(COLOR.iter()) {
+            assert!(
+                i32::from(*got).abs_diff(i32::from(*want)) < 40,
+                "drifted: {center:?}"
+            );
+        }
+        Ok(())
+    }
 }
